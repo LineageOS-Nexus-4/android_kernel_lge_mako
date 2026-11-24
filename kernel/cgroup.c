@@ -2184,12 +2184,14 @@ retry_find_task:
 		}
 		/*
 		 * even if we're attaching all tasks in the thread group, we
-		 * only need to check permissions on one of them.
+		 * only need to check permissions on one of them. Android's
+		 * system_server uses CAP_SYS_NICE to manage app cgroups.
 		 */
 		tcred = __task_cred(tsk);
 		if (cred->euid &&
 		    cred->euid != tcred->uid &&
-		    cred->euid != tcred->suid) {
+		    cred->euid != tcred->suid &&
+		    !ns_capable(tcred->user_ns, CAP_SYS_NICE)) {
 			/*
 			 * if the default permission check fails, give each
 			 * cgroup a chance to extend the permission check
