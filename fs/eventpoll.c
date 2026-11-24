@@ -1464,7 +1464,7 @@ static inline struct timespec ep_set_mstimeout(long ms)
  *          error code, in case of error.
  */
 static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
-		   int maxevents, long timeout)
+		   int maxevents, long timeout, const ktime_t *deadline)
 {
 	int res = 0, eavail, timed_out = 0;
 	unsigned long flags;
@@ -1472,7 +1472,10 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 	wait_queue_t wait;
 	ktime_t expires, *to = NULL;
 
-	if (timeout > 0) {
+	if (deadline) {
+		expires = *deadline;
+		to = &expires;
+	} else if (timeout > 0) {
 		struct timespec end_time = ep_set_mstimeout(timeout);
 
 		slack = select_estimate_accuracy(&end_time);
@@ -1831,8 +1834,8 @@ error_return:
  * Implement the event wait interface for the eventpoll file. It is the kernel
  * part of the user space epoll_wait(2).
  */
-SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
-		int, maxevents, int, timeout)
+static int do_epoll_wait(int epfd, struct epoll_event __user *events,
+			int maxevents, int timeout, const ktime_t *deadline)
 {
 	int error;
 	struct file *file;
@@ -1869,7 +1872,7 @@ SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
 	ep = file->private_data;
 
 	/* Time to fish for events ... */
-	error = ep_poll(ep, events, maxevents, timeout);
+	error = ep_poll(ep, events, maxevents, timeout, deadline);
 
 error_fput:
 	fput(file);
@@ -1878,15 +1881,21 @@ error_return:
 	return error;
 }
 
+SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
+		int, maxevents, int, timeout)
+{
+	return do_epoll_wait(epfd, events, maxevents, timeout, NULL);
+}
+
 #ifdef HAVE_SET_RESTORE_SIGMASK
 
 /*
  * Implement the event wait interface for the eventpoll file. It is the kernel
  * part of the user space epoll_pwait(2).
  */
-SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
-		int, maxevents, int, timeout, const sigset_t __user *, sigmask,
-		size_t, sigsetsize)
+static int do_epoll_pwait(int epfd, struct epoll_event __user *events,
+			 int maxevents, int timeout, const ktime_t *deadline,
+			 const sigset_t __user *sigmask, size_t sigsetsize)
 {
 	int error;
 	sigset_t ksigmask, sigsaved;
@@ -1904,7 +1913,7 @@ SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
 		sigprocmask(SIG_SETMASK, &ksigmask, &sigsaved);
 	}
 
-	error = sys_epoll_wait(epfd, events, maxevents, timeout);
+	error = do_epoll_wait(epfd, events, maxevents, timeout, deadline);
 
 	/*
 	 * If we changed the signal mask, we need to restore the original one.
@@ -1922,6 +1931,70 @@ SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
 	}
 
 	return error;
+}
+
+SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
+		int, maxevents, int, timeout, const sigset_t __user *, sigmask,
+		size_t, sigsetsize)
+{
+	return do_epoll_pwait(epfd, events, maxevents, timeout, NULL,
+			     sigmask, sigsetsize);
+}
+
+/* Fixed-width time64 syscall ABI, including on 32-bit ARM. */
+struct __kernel_timespec {
+	__s64 tv_sec;
+	__s64 tv_nsec;
+};
+
+static ktime_t ep_set_hrtimeout(const struct __kernel_timespec *ts)
+{
+	ktime_t now = ktime_get();
+
+#if BITS_PER_LONG == 64 || defined(CONFIG_KTIME_SCALAR)
+	s64 nsecs;
+
+	/* Validate before multiplying or narrowing either time64 field. */
+	if (ts->tv_sec > KTIME_MAX / NSEC_PER_SEC ||
+	    (ts->tv_sec == KTIME_MAX / NSEC_PER_SEC &&
+	     ts->tv_nsec > KTIME_MAX % NSEC_PER_SEC))
+		return (ktime_t) { .tv64 = KTIME_MAX };
+	nsecs = ts->tv_sec * NSEC_PER_SEC + ts->tv_nsec;
+	if (nsecs > KTIME_MAX - now.tv64)
+		return (ktime_t) { .tv64 = KTIME_MAX };
+	return ktime_add_ns(now, nsecs);
+#else
+	/* The older split representation cannot encode time64 seconds. */
+	if (ts->tv_sec > LONG_MAX)
+		return ktime_set(LONG_MAX, NSEC_PER_SEC - 1);
+	return ktime_add_safe(now, ktime_set(ts->tv_sec, ts->tv_nsec));
+#endif
+}
+
+/* Nanosecond epoll wait, based on upstream 58169a52ebc9 (Linux 5.11). */
+SYSCALL_DEFINE6(epoll_pwait2, int, epfd, struct epoll_event __user *, events,
+		int, maxevents, const struct __kernel_timespec __user *, timeout,
+		const sigset_t __user *, sigmask, size_t, sigsetsize)
+{
+	struct __kernel_timespec ts;
+	ktime_t expires, *deadline = NULL;
+	int wait = -1;
+
+	if (timeout) {
+		if (copy_from_user(&ts, timeout, sizeof(ts)))
+			return -EFAULT;
+		if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC)
+			return -EINVAL;
+		if (ts.tv_sec || ts.tv_nsec) {
+			expires = ep_set_hrtimeout(&ts);
+			deadline = &expires;
+		} else {
+			wait = 0;
+		}
+	}
+
+	return do_epoll_pwait(epfd, events, maxevents, wait, deadline,
+			     sigmask, sigsetsize);
 }
 
 #endif /* HAVE_SET_RESTORE_SIGMASK */
