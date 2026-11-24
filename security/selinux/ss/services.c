@@ -633,6 +633,9 @@ void services_compute_xperms_drivers(
 		/* if allowing permissions within a driver */
 		security_xperm_set(xperms->drivers.p,
 					node->datum.u.xperms->driver);
+	} else if (node->datum.u.xperms->specified == AVTAB_XPERMS_NLMSG) {
+		/* Netlink still uses the legacy message permission table. */
+		return;
 	}
 
 	/* If no ioctl commands are allowed, ignore auditallow and auditdeny */
@@ -947,6 +950,8 @@ void services_compute_xperms_decision(struct extended_perms_decision *xpermd,
 		if (!security_xperm_test(node->datum.u.xperms->perms.p,
 					xpermd->driver))
 			return;
+	} else if (node->datum.u.xperms->specified == AVTAB_XPERMS_NLMSG) {
+		return;
 	} else {
 		BUG();
 	}
