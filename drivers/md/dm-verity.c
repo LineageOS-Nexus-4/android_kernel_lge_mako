@@ -18,6 +18,7 @@
 
 #include <linux/module.h>
 #include <linux/device-mapper.h>
+#include <linux/reboot.h>
 #include <crypto/hash.h>
 
 #define DM_MSG_PREFIX			"verity"
@@ -27,6 +28,8 @@
 #define DM_VERITY_DEFAULT_PREFETCH_SIZE	262144
 
 #define DM_VERITY_MAX_LEVELS		63
+#define DM_VERITY_OPT_RESTART		"restart_on_corruption"
+#define DM_VERITY_OPT_ZERO		"ignore_zero_blocks"
 
 static unsigned dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
 
@@ -41,6 +44,7 @@ struct dm_verity {
 	struct crypto_shash *tfm;
 	u8 *root_digest;	/* digest of the root block */
 	u8 *salt;		/* salt: its size is salt_size */
+	u8 *zero_digest;
 	unsigned salt_size;
 	sector_t data_start;	/* data offset in 512-byte sectors */
 	sector_t hash_start;	/* hash start in blocks */
@@ -54,6 +58,8 @@ struct dm_verity {
 	unsigned digest_size;	/* digest size for the current hash algorithm */
 	unsigned shash_descsize;/* the size of temporary space for crypto */
 	int hash_failed;	/* set to 1 if hash of any block failed */
+	bool restart_on_corruption;
+	bool ignore_zero_blocks;
 
 	mempool_t *io_mempool;	/* mempool of struct dm_verity_io */
 	mempool_t *vec_mempool;	/* mempool of bio vector */
@@ -174,12 +180,20 @@ static void verity_hash_at_level(struct dm_verity *v, sector_t block, int level,
 		*offset = idx << (v->hash_dev_block_bits - v->hash_per_block_bits);
 }
 
+static int verity_corruption(struct dm_verity *v)
+{
+	v->hash_failed = 1;
+	if (v->restart_on_corruption)
+		kernel_restart("dm-verity device corrupted");
+	return -EIO;
+}
+
 /*
  * Verify hash of a metadata block pertaining to the specified data block
  * ("block" argument) at a specified level ("level" argument).
  *
  * On successful return, io_want_digest(v, io) contains the hash value for
- * a lower tree level or for the data block (if we're at the lowest leve).
+ * a lower tree level or for the data block (if we're at the lowest level).
  *
  * If "skip_unverified" is true, unverified buffer is skipped and 1 is returned.
  * If "skip_unverified" is false, unverified buffer is hashed and verified
@@ -253,8 +267,7 @@ static int verity_verify_level(struct dm_verity_io *io, sector_t block,
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("metadata block %llu is corrupted",
 				(unsigned long long)hash_block);
-			v->hash_failed = 1;
-			r = -EIO;
+			r = verity_corruption(v);
 			goto release_ret_r;
 		} else
 			aux->hash_verified = 1;
@@ -285,6 +298,7 @@ static int verity_verify_io(struct dm_verity_io *io)
 
 	for (b = 0; b < io->n_blocks; b++) {
 		struct shash_desc *desc;
+		bool is_zero;
 		u8 *result;
 		int r;
 		unsigned todo;
@@ -313,20 +327,25 @@ static int verity_verify_io(struct dm_verity_io *io)
 		}
 
 test_block_hash:
+		/* The expected digest came from the verified hash tree. */
+		is_zero = v->zero_digest &&
+			!memcmp(v->zero_digest, io_want_digest(v, io), v->digest_size);
 		desc = io_hash_desc(v, io);
-		desc->tfm = v->tfm;
-		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
-		r = crypto_shash_init(desc);
-		if (r < 0) {
-			DMERR("crypto_shash_init failed: %d", r);
-			return r;
-		}
-
-		if (likely(v->version >= 1)) {
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (!is_zero) {
+			desc->tfm = v->tfm;
+			desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+			r = crypto_shash_init(desc);
 			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
+				DMERR("crypto_shash_init failed: %d", r);
 				return r;
+			}
+
+			if (likely(v->version >= 1)) {
+				r = crypto_shash_update(desc, v->salt, v->salt_size);
+				if (r < 0) {
+					DMERR("crypto_shash_update failed: %d", r);
+					return r;
+				}
 			}
 		}
 
@@ -342,8 +361,13 @@ test_block_hash:
 			len = bv->bv_len - offset;
 			if (likely(len >= todo))
 				len = todo;
-			r = crypto_shash_update(desc,
-					page + bv->bv_offset + offset, len);
+			if (is_zero) {
+				memset(page + bv->bv_offset + offset, 0, len);
+				r = 0;
+			} else {
+				r = crypto_shash_update(desc,
+						page + bv->bv_offset + offset, len);
+			}
 			kunmap_atomic(page);
 			if (r < 0) {
 				DMERR("crypto_shash_update failed: %d", r);
@@ -356,6 +380,9 @@ test_block_hash:
 			}
 			todo -= len;
 		} while (todo);
+
+		if (is_zero)
+			continue;
 
 		if (!v->version) {
 			r = crypto_shash_update(desc, v->salt, v->salt_size);
@@ -374,8 +401,7 @@ test_block_hash:
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("data block %llu is corrupted",
 				(unsigned long long)(io->block + b));
-			v->hash_failed = 1;
-			return -EIO;
+			return verity_corruption(v);
 		}
 	}
 	BUG_ON(vector != io->io_vec_size);
@@ -544,6 +570,13 @@ static void verity_status(struct dm_target *ti, status_type_t type,
 		else
 			for (x = 0; x < v->salt_size; x++)
 				DMEMIT("%02x", v->salt[x]);
+		x = v->restart_on_corruption + v->ignore_zero_blocks;
+		if (x)
+			DMEMIT(" %u", x);
+		if (v->restart_on_corruption)
+			DMEMIT(" %s", DM_VERITY_OPT_RESTART);
+		if (v->ignore_zero_blocks)
+			DMEMIT(" %s", DM_VERITY_OPT_ZERO);
 		break;
 	}
 }
@@ -616,6 +649,7 @@ static void verity_dtr(struct dm_target *ti)
 
 	kfree(v->salt);
 	kfree(v->root_digest);
+	kfree(v->zero_digest);
 
 	if (v->tfm)
 		crypto_free_shash(v->tfm);
@@ -631,6 +665,68 @@ static void verity_dtr(struct dm_target *ti)
 	kfree(v);
 }
 
+static int verity_parse_opt_args(struct dm_target *ti, unsigned argc, char **argv)
+{
+	struct dm_verity *v = ti->private;
+	struct dm_arg_set args = { .argc = argc, .argv = argv };
+	struct dm_arg count_arg = { 0, 2, "Invalid verity option count" };
+	unsigned count;
+	const char *option;
+
+	if (!argc)
+		return 0;
+	if (dm_read_arg_group(&count_arg, &args, &count, &ti->error))
+		return -EINVAL;
+	if (args.argc != count) {
+		ti->error = "Unexpected trailing verity arguments";
+		return -EINVAL;
+	}
+
+	while ((option = dm_shift_arg(&args))) {
+		if (!strcmp(option, DM_VERITY_OPT_RESTART) &&
+		    !v->restart_on_corruption) {
+			v->restart_on_corruption = true;
+		} else if (!strcmp(option, DM_VERITY_OPT_ZERO) &&
+			   !v->ignore_zero_blocks) {
+			v->ignore_zero_blocks = true;
+		} else {
+			ti->error = "Unknown or duplicate verity option";
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+static int verity_init_zero_digest(struct dm_verity *v)
+{
+	unsigned block_size = 1U << v->data_dev_block_bits;
+	struct shash_desc *desc;
+	u8 *zero;
+	int r = -ENOMEM;
+
+	desc = kmalloc(v->shash_descsize, GFP_KERNEL);
+	zero = kzalloc(block_size, GFP_KERNEL);
+	v->zero_digest = kmalloc(v->digest_size, GFP_KERNEL);
+	if (!desc || !zero || !v->zero_digest)
+		goto out;
+
+	desc->tfm = v->tfm;
+	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+	r = crypto_shash_init(desc);
+	if (!r && v->version)
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+	if (!r)
+		r = crypto_shash_update(desc, zero, block_size);
+	if (!r && !v->version)
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+	if (!r)
+		r = crypto_shash_final(desc, v->zero_digest);
+out:
+	kfree(zero);
+	kfree(desc);
+	return r;
+}
+
 /*
  * Target parameters:
  *	<version>	The current format is version 1.
@@ -644,6 +740,7 @@ static void verity_dtr(struct dm_target *ti)
  *	<algorithm>
  *	<digest>
  *	<salt>		Hex string or "-" if no salt.
+ *	[<option count> <options>]
  */
 static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 {
@@ -669,11 +766,14 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	if (argc != 10) {
-		ti->error = "Invalid argument count: exactly 10 arguments required";
+	if (argc < 10) {
+		ti->error = "Invalid argument count: at least 10 arguments required";
 		r = -EINVAL;
 		goto bad;
 	}
+	r = verity_parse_opt_args(ti, argc - 10, argv + 10);
+	if (r)
+		goto bad;
 
 	if (sscanf(argv[0], "%d%c", &num, &dummy) != 1 ||
 	    num < 0 || num > 1) {
@@ -787,6 +887,14 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		    hex2bin(v->salt, argv[9], v->salt_size)) {
 			ti->error = "Invalid salt";
 			r = -EINVAL;
+			goto bad;
+		}
+	}
+
+	if (v->ignore_zero_blocks) {
+		r = verity_init_zero_digest(v);
+		if (r) {
+			ti->error = "Cannot calculate digest of a zero block";
 			goto bad;
 		}
 	}
