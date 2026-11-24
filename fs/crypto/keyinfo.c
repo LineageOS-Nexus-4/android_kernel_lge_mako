@@ -10,9 +10,10 @@
 
 #include <keys/encrypted-type.h>
 #include <keys/user-type.h>
+#include <linux/export.h>
 #include <linux/random.h>
 #include <linux/scatterlist.h>
-#include <uapi/linux/keyctl.h>
+#include <linux/keyctl.h>
 #include <crypto/hash.h>
 #include <linux/fscrypto.h>
 
@@ -86,11 +87,13 @@ static int validate_user_key(struct fscrypt_info *crypt_info,
 			struct fscrypt_context *ctx, u8 *raw_key,
 			u8 *prefix, int prefix_size)
 {
-	u8 *full_key_descriptor;
+	char *full_key_descriptor;
+	char *descriptor;
 	struct key *keyring_key;
 	struct fscrypt_key *master_key;
 	const struct user_key_payload *ukp;
 	int full_key_len = prefix_size + (FS_KEY_DESCRIPTOR_SIZE * 2) + 1;
+	int i;
 	int res;
 
 	full_key_descriptor = kmalloc(full_key_len, GFP_NOFS);
@@ -98,10 +101,10 @@ static int validate_user_key(struct fscrypt_info *crypt_info,
 		return -ENOMEM;
 
 	memcpy(full_key_descriptor, prefix, prefix_size);
-	sprintf(full_key_descriptor + prefix_size,
-			"%*phN", FS_KEY_DESCRIPTOR_SIZE,
-			ctx->master_key_descriptor);
-	full_key_descriptor[full_key_len - 1] = '\0';
+	descriptor = full_key_descriptor + prefix_size;
+	for (i = 0; i < FS_KEY_DESCRIPTOR_SIZE; i++)
+		descriptor = hex_byte_pack(descriptor, ctx->master_key_descriptor[i]);
+	*descriptor = '\0';
 	keyring_key = request_key(&key_type_logon, full_key_descriptor, NULL);
 	kfree(full_key_descriptor);
 	if (IS_ERR(keyring_key))

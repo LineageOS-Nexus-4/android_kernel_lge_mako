@@ -27,6 +27,7 @@
 #include <linux/scatterlist.h>
 #include <linux/ratelimit.h>
 #include <linux/bio.h>
+#include <linux/completion.h>
 #include <linux/dcache.h>
 #include <linux/namei.h>
 #include <linux/fscrypto.h>
@@ -284,6 +285,31 @@ int fscrypt_decrypt_page(struct page *page)
 }
 EXPORT_SYMBOL(fscrypt_decrypt_page);
 
+struct fscrypt_bio_wait {
+	struct completion done;
+	int error;
+};
+
+static void fscrypt_bio_end_io(struct bio *bio, int error)
+{
+	struct fscrypt_bio_wait *wait = bio->bi_private;
+
+	wait->error = error;
+	complete(&wait->done);
+}
+
+static int fscrypt_write_bio_wait(struct bio *bio)
+{
+	struct fscrypt_bio_wait wait;
+
+	init_completion(&wait.done);
+	bio->bi_private = &wait;
+	bio->bi_end_io = fscrypt_bio_end_io;
+	submit_bio(WRITE | REQ_SYNC, bio);
+	wait_for_completion(&wait.done);
+	return wait.error;
+}
+
 int fscrypt_zeroout_range(struct inode *inode, pgoff_t lblk,
 				sector_t pblk, unsigned int len)
 {
@@ -328,7 +354,7 @@ int fscrypt_zeroout_range(struct inode *inode, pgoff_t lblk,
 			err = -EIO;
 			goto errout;
 		}
-		err = submit_bio_wait(WRITE, bio);
+		err = fscrypt_write_bio_wait(bio);
 		bio_put(bio);
 		if (err)
 			goto errout;
@@ -356,7 +382,7 @@ static int fscrypt_d_revalidate(struct dentry *dentry, unsigned int flags)
 		return -ECHILD;
 
 	dir = dget_parent(dentry);
-	if (!d_inode(dir)->i_sb->s_cop->is_encrypted(d_inode(dir))) {
+	if (!dir->d_inode->i_sb->s_cop->is_encrypted(dir->d_inode)) {
 		dput(dir);
 		return 0;
 	}
@@ -365,7 +391,7 @@ static int fscrypt_d_revalidate(struct dentry *dentry, unsigned int flags)
 	spin_lock(&dentry->d_lock);
 	cached_with_key = dentry->d_flags & DCACHE_ENCRYPTED_WITH_KEY;
 	spin_unlock(&dentry->d_lock);
-	dir_has_key = (d_inode(dir)->i_crypt_info != NULL);
+	dir_has_key = (dir->d_inode->i_crypt_info != NULL);
 	dput(dir);
 
 	/*
@@ -399,11 +425,10 @@ static void completion_pages(struct work_struct *work)
 	struct fscrypt_ctx *ctx =
 		container_of(work, struct fscrypt_ctx, r.work);
 	struct bio *bio = ctx->r.bio;
-	struct bio_vec *bv;
 	int i;
 
-	bio_for_each_segment_all(bv, bio, i) {
-		struct page *page = bv->bv_page;
+	for (i = 0; i < bio->bi_vcnt; i++) {
+		struct page *page = bio->bi_io_vec[i].bv_page;
 		int ret = fscrypt_decrypt_page(page);
 
 		if (ret) {

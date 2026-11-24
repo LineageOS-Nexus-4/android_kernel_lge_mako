@@ -1235,11 +1235,22 @@ static int sanity_check_raw_super(struct f2fs_sb_info *sbi,
 					(bh->b_data + F2FS_SUPER_OFFSET);
 	struct super_block *sb = sbi->sb;
 	unsigned int blocksize;
+	u32 features, supported_features = 0;
 
 	if (F2FS_SUPER_MAGIC != le32_to_cpu(raw_super->magic)) {
 		f2fs_msg(sb, KERN_INFO,
 			"Magic Mismatch, valid(0x%x) - read(0x%x)",
 			F2FS_SUPER_MAGIC, le32_to_cpu(raw_super->magic));
+		return 1;
+	}
+
+	/* This driver predates extra inode attributes and quota metadata. */
+	if (IS_ENABLED(CONFIG_F2FS_FS_ENCRYPTION))
+		supported_features = F2FS_FEATURE_ENCRYPT;
+	features = le32_to_cpu(raw_super->feature) & ~supported_features;
+	if (features) {
+		f2fs_msg(sb, KERN_ERR, "Unsupported F2FS superblock features: 0x%x",
+			 features);
 		return 1;
 	}
 
